@@ -1,16 +1,28 @@
 "use client";
 
-import { useState } from "react";
+import React, { useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Database } from "@/lib/supabase";
 import { BookmarkCard } from "./bookmark-card";
 import { BookmarkListItem } from "./bookmark-list-item";
 import {
-  DragDropContext,
-  Droppable,
-  Draggable,
-  DropResult,
-} from "@hello-pangea/dnd";
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  KeyboardSensor,
+  useSensor,
+  useSensors,
+  DragEndEvent,
+ } from "@dnd-kit/core";
+import {
+  arrayMove,
+  SortableContext,
+  useSortable,
+  rectSortingStrategy,
+  verticalListSortingStrategy,
+  sortableKeyboardCoordinates,
+ } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { Grid, List, LayoutGrid, Newspaper } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -27,6 +39,33 @@ interface BookmarkViewsProps {
   isSearching?: boolean;
 }
 
+// single sortable item wrapper using dnd-kit
+function SortableItem({id, children, viewMode }: { id: string, children: React.ReactNode, viewMode: ViewMode }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id });
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    zIndex: isDragging ? 50 : undefined,
+    touchAction: "manipulation",
+  };
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      {...attributes}
+      {...listeners}
+      className={cn(
+        "transition-transform duration-200 ease-in-out",
+        isDragging && "scale-105 shadow-lg",
+        viewMode === "masonry" && "break-inside-avoid mv-4"
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
 export function BookmarkViews({
   bookmarks,
   onBookmarkUpdate,
@@ -38,20 +77,35 @@ export function BookmarkViews({
 }: BookmarkViewsProps) {
   const [viewMode, setViewMode] = useState<ViewMode>("grid");
 
-  const handleDragEnd = (result: DropResult) => {
-    if (!result.destination) return;
+  // sensors for pointer and keyboard
+  const pointerSensor = useSensor(PointerSensor, {
+    activationConstraint: {
+      distance: 5, // Only start dragging after pointer moved 5px
+    },
+  });
 
-    const items = Array.from(bookmarks);
-    const [reorderedItem] = items.splice(result.source.index, 1);
-    items.splice(result.destination.index, 0, reorderedItem);
+  const keyboardSensor = useSensor(KeyboardSensor, {
+    coordinateGetter: sortableKeyboardCoordinates,
+  });
 
-    const updatedBookmarks = items.map((bookmark, index) => ({
-      ...bookmark,
-      sort_order: index,
-    }));
+  const sensors = useSensors(pointerSensor, keyboardSensor);
 
-    onReorder(updatedBookmarks);
-  };
+  const ids = useMemo(() => bookmarks.map((b) => String(b.id)), [bookmarks]);
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+
+    const oldIndex = ids.indexOf(String(active.id));
+    const newIndex = ids.indexOf(String(over.id));
+    if (oldIndex === -1 || newIndex === -1) return;
+
+    const newOrder = arrayMove(bookmarks, oldIndex, newIndex);
+    const updated = newOrder.map((b, i) => ({ ...b, sort_order: i }));
+
+    // send new order upstream
+    onReorder(updated);
+  }
 
   const viewModeOptions = [
     { mode: "list" as ViewMode, icon: List, label: "List" },
@@ -60,7 +114,7 @@ export function BookmarkViews({
     { mode: "headlines" as ViewMode, icon: Newspaper, label: "Headlines" },
   ];
 
-  const renderBookmark = (bookmark: Bookmark, index: number) => {
+  const renderBookmark = (bookmark: Bookmark) => {
     const commonProps = {
       bookmark,
       onUpdate: (updates: any) => onBookmarkUpdate(bookmark.id, updates),
@@ -86,7 +140,8 @@ export function BookmarkViews({
       case "grid":
         return "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4";
       case "masonry":
-        return "columns-1 md:columns-2 lg:columns-3 xl:columns-4 gap-4 space-y-4";
+        return "grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 auto-rows-fr"
+        // return "columns-1 md:columns-2 lg:columns-3 xl:columns-4 gap-4 space-y-4";
       case "list":
       case "headlines":
         return "space-y-2";
@@ -94,6 +149,11 @@ export function BookmarkViews({
         return "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4";
     }
   };
+
+  const sortingStrategy = 
+    viewMode === "list" || viewMode === "headlines"
+      ? verticalListSortingStrategy
+      : rectSortingStrategy;
 
   return (
     <div className="space-y-6">
@@ -110,7 +170,8 @@ export function BookmarkViews({
             </p>
           )}
         </div>
-        <div className="flex items-center bg-muted rounded-lg p-1">
+
+        <div className="flex items-center bg-muted rounded-lg p-2">
           {viewModeOptions.map(({ mode, icon: Icon, label }) => (
             <Button
               key={mode}
@@ -126,52 +187,29 @@ export function BookmarkViews({
         </div>
       </div>
 
-      <DragDropContext onDragEnd={handleDragEnd}>
-        <Droppable
-          droppableId="bookmarks"
-          direction={
-            viewMode === "list" || viewMode === "headlines"
-              ? "vertical"
-              : "horizontal"
-          }
-        >
-          {(provided, snapshot) => (
-            <div
-              ref={provided.innerRef}
-              {...provided.droppableProps}
-              className={cn(
-                getGridClass(),
-                snapshot.isDraggingOver &&
-                  "bg-accent/20 rounded-lg transition-colors"
-              )}
-            >
-              {bookmarks.map((bookmark, index) => (
-                <Draggable
-                  key={bookmark.id}
-                  draggableId={bookmark.id}
-                  index={index}
-                >
-                  {(provided, snapshot) => (
-                    <div
-                      ref={provided.innerRef}
-                      {...provided.draggableProps}
-                      {...provided.dragHandleProps}
-                      className={cn(
-                        "transition-transform",
-                        snapshot.isDragging && "rotate-2 scale-105 shadow-lg",
-                        viewMode === "masonry" && "break-inside-avoid mb-4"
-                      )}
-                    >
-                      {renderBookmark(bookmark, index)}
-                    </div>
-                  )}
-                </Draggable>
-              ))}
-              {provided.placeholder}
-            </div>
-          )}
-        </Droppable>
-      </DragDropContext>
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext items={ids} strategy={sortingStrategy}>
+          <div
+            className={cn(getGridClass(), "relative")}
+            // for smooth animation of grid children
+            style={{ gridAutoRows: "1fr" }}
+          >
+            {bookmarks.map((bookmark) => (
+              <SortableItem
+                key={bookmark.id}
+                id={String(bookmark.id)}
+                viewMode={viewMode}
+              >
+                {renderBookmark(bookmark)}
+              </SortableItem>
+            ))}
+          </div>
+        </SortableContext>
+      </DndContext>
 
       {bookmarks.length === 0 && (
         <div className="text-center py-12">
